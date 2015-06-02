@@ -58,5 +58,22 @@ namespace TinyTwitter
 				Thread.Sleep(TimeSpan.FromMinutes(1));
 			}
 		}
+
+		[TestMethod]
+		public void Tweet_video() {
+
+			var twitter = CreateTinyTwitter();
+			var sampleFile = Path.Combine( AppDomain.CurrentDomain.BaseDirectory, "test.mp4" );
+
+			for( var i = 0; i < 5; i++ ) {
+				string media_id = null;
+				using( var stream = File.OpenRead( sampleFile ) ) {
+					media_id = twitter.UploadMedia( stream, "video/mp4" );
+				}
+
+				twitter.UpdateStatusWithMedia( Guid.NewGuid().ToString(), media_id );
+				Assert.IsNotNull( media_id );
+			}
+		}
 	}
 }

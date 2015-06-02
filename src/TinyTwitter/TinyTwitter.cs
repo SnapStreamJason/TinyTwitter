@@ -28,6 +28,13 @@ namespace TinyTwitter
 		public string Text { get; set; }
 	}
 
+	public class ChunkedInitResult 
+	{
+		public long media_id { get; set; }
+		public string media_id_string { get; set; }
+		public int expires_after_secs { get; set; }
+	}
+
 	public class TinyTwitter
 	{
 		private readonly OAuthInfo oauth;
@@ -57,6 +64,80 @@ namespace TinyTwitter
 		public IEnumerable<Tweet> GetUserTimeline(long? sinceId = null, long? maxId = null, int? count = 20, string screenName = "")
 		{
 			return GetTimeline("https://api.twitter.com/1.1/statuses/user_timeline.json", sinceId, maxId, count, screenName);
+		}
+
+		public string UpdateStatusWithMedia( string message, string media ) 
+		{
+			//You can get a "The validation of media ids failed." error here when there was something wrong with the video encode
+			//Upload succeeds, but then the actual status update fails. I believe there is an unstated MOOV before MDAT requirement on the files.
+			string web = new RequestBuilder( oauth, "POST", "https://api.twitter.com/1.1/statuses/update.json" )
+				.AddParameter( "status", message )
+				.AddParameter( "media_ids", media )
+				.Execute();
+			return web;
+		}
+
+		public string UploadMedia( Stream file, string mediaType ) 
+		{
+
+			// Make the initial request, this should get us the id we want to use
+			string response = new RequestBuilder( oauth, "POST", "https://upload.twitter.com/1.1/media/upload.json" )
+				.AddParameter( "command", "INIT" )
+				.AddParameter( "media_type", mediaType )
+				.AddParameter( "total_bytes", file.Length.ToString() )
+				.Execute();
+
+			var serializer = new JavaScriptSerializer();
+			var initResult = serializer.Deserialize<ChunkedInitResult>( response );
+
+			long pos = 0;
+			long totalBytes = file.Length;
+			int segment = 0;
+
+			while( pos < totalBytes ) {
+				byte[] bytes = new byte[ Math.Min( 1 * 1024 * 1024, totalBytes - pos ) ];
+
+				int bytesToRead = bytes.Length;
+				int totalBytesRead = 0;
+
+				while( totalBytesRead < bytesToRead ) {
+					int bytesRead = file.Read( bytes, totalBytesRead, bytesToRead - totalBytesRead );
+
+					if( bytesRead == 0 ) {
+						throw new Exception( "Read 0 bytes!" );
+					}
+
+					totalBytesRead += bytesRead;
+				}
+
+				response = new RequestBuilder( oauth, "POST", "https://upload.twitter.com/1.1/media/upload.json" )
+					.AddParameter( "command", "APPEND" )
+					.AddParameter( "media_id", initResult.media_id_string )
+					.AddParameter( "segment_index", segment.ToString() )
+					.MultipartExecute( bytes );
+
+
+				/*
+				 * Documentation doesn't mention this, but it seems to work. There's a Non multipart way
+				 * to upload a chunk. In this case all the parameters are used in the signature, not just the oauth_* ones
+				 * 	web = new RequestBuilder( oauth, "POST", "https://upload.twitter.com/1.1/media/upload.json" )
+						.AddParameter( "command", "APPEND" )
+						.AddParameter( "media_id", initResult.media_id_string )
+						.AddParameter( "segment_index", segment.ToString() )
+						.AddParameter( "media_data", System.Convert.ToBase64String( bytes ) )
+						.Execute();
+				 * */
+
+				segment++;
+				pos += bytes.Length;
+			}
+
+			response = new RequestBuilder( oauth, "POST", "https://upload.twitter.com/1.1/media/upload.json" )
+				.AddParameter( "command", "FINALIZE" )
+				.AddParameter( "media_id", initResult.media_id_string )
+				.Execute();
+
+			return initResult.media_id_string;
 		}
 
 		private IEnumerable<Tweet> GetTimeline(string url, long? sinceId, long? maxId, int? count, string screenName)
@@ -144,23 +225,85 @@ namespace TinyTwitter
 
 				WriteRequestBody(request);
 
-				// It looks like a bug in HttpWebRequest. It throws random TimeoutExceptions
-				// after some requests. Abort the request seems to work. More info: 
-				// http://stackoverflow.com/questions/2252762/getrequeststream-throws-timeout-exception-randomly
-
-				var response = request.GetResponse();
-
 				string content;
 
-				using (var stream = response.GetResponseStream())
-				{
-					using (var reader = new StreamReader(stream))
-					{
-						content = reader.ReadToEnd();
+				WebResponse response = null;
+
+				try {
+					response = request.GetResponse();
+					using( var stream = response.GetResponseStream() ) {
+						using( var reader = new StreamReader( stream ) ) {
+							content = reader.ReadToEnd();
+						}
+					}
+				}
+				// Useful for debugging
+				/*catch( WebException ex ) {
+
+					using( var stream = ex.Response.GetResponseStream() ) {
+						using( var reader = new StreamReader( stream ) ) {
+							content = reader.ReadToEnd();
+						}
+					}
+					throw;
+				}*/
+				finally {
+					if( response != null ) {
+						( (IDisposable)response ).Dispose();
 					}
 				}
 
-				request.Abort();
+				return content;
+			}
+
+			public string MultipartExecute( byte[] bytes )
+			{
+				var timespan = GetTimestamp();
+				var nonce = CreateNonce();
+
+				var parameters = new Dictionary<string, string>();
+				AddOAuthParameters( parameters, timespan, nonce );
+
+				// for multi-part requests, the signature is only generated over the oauth_ parameters
+				var signature = GenerateSignature( parameters );
+				var headerValue = GenerateAuthorizationHeaderValue( parameters, signature );
+
+				var request = (HttpWebRequest)WebRequest.Create( GetRequestUrl() );
+				request.Method = method;
+				string boundary = "----------" + DateTime.Now.Ticks.ToString( "x" );
+				request.ContentType = "multipart/form-data; boundary=" + boundary;
+
+				request.Headers.Add( "Authorization", headerValue );
+
+				WriteMultipartRequestBody( request.GetRequestStream(), boundary, customParameters, bytes );
+
+				string content;
+
+				WebResponse response = null;
+
+				try {
+					response = request.GetResponse();
+					using( var stream = response.GetResponseStream() ) {
+						using( var reader = new StreamReader( stream ) ) {
+							content = reader.ReadToEnd();
+						}
+					}
+				}
+				// Useful for debugging
+				/*catch( WebException ex ) {
+
+					using( var stream = ex.Response.GetResponseStream() ) {
+						using( var reader = new StreamReader( stream ) ) {
+							content = reader.ReadToEnd();
+						}
+					}
+					throw;
+				}*/
+				finally {
+					if( response != null ) {
+						( (IDisposable)response ).Dispose();
+					}
+				}
 
 				return content;
 			}
@@ -235,6 +378,35 @@ namespace TinyTwitter
 			{
 				return new Random().Next(0x0000000, 0x7fffffff).ToString("X8");
 			}
+
+			private static void WriteMultipartRequestBody( Stream requestStream, string boundary, IDictionary<string, string> parameters, byte[] fileData ) {
+				byte[]	boundarybytes = Encoding.ASCII.GetBytes( "--" + boundary + "\r\n" );
+				byte[]	trailer = Encoding.ASCII.GetBytes( "\r\n--" + boundary + "–-\r\n" );
+				byte[]	temp = null;
+
+				if( parameters != null ) {
+					foreach( string key in parameters.Keys ) {
+
+						requestStream.Write( boundarybytes, 0, boundarybytes.Length );
+						temp = Encoding.ASCII.GetBytes( string.Format( "Content-Disposition: form-data; name=\"{0}\"\r\n\r\n{1}", key, parameters[ key ] ) );
+						requestStream.Write( temp, 0, temp.Length );
+						temp = Encoding.ASCII.GetBytes( "\r\n" );
+						requestStream.Write( temp, 0, temp.Length );
+					}
+				}
+
+				//Getting this right is tricky, multipart requests will just end up with "media not found" errors when not done properly
+				requestStream.Write( boundarybytes, 0, boundarybytes.Length );
+				temp = Encoding.ASCII.GetBytes( string.Format( "Content-Disposition: form-data; name=\"{0}\"\r\n", "media" ) );
+				requestStream.Write( temp, 0, temp.Length );
+
+				// documentation says this is required, but I've seen it work just fine without it
+				temp = Encoding.ASCII.GetBytes( "Content-Type: application/octect-stream\r\n\r\n" );
+				requestStream.Write( temp, 0, temp.Length );
+
+				requestStream.Write( fileData, 0, fileData.Length );
+				requestStream.Write( trailer, 0, trailer.Length );
+			}
 		}
 
 		#endregion
@@ -257,9 +429,30 @@ namespace TinyTwitter
 			// From Twitterizer http://www.twitterizer.net/
 
 			if (string.IsNullOrEmpty(value))
+			{
 				return string.Empty;
+			}
 
-			var encoded = Uri.EscapeDataString(value);
+			int limit = 20000;
+
+			//Handle very large strings, Uri.EscapeDataString has a max length of 32766
+			// so we'll look at this in chunks and append it all together
+			StringBuilder sb = new StringBuilder(value.Length);
+			int loops = value.Length / limit;
+
+			for(int i = 0; i <= loops; i++)
+			{
+				if(i < loops)
+				{
+					sb.Append(Uri.EscapeDataString(value.Substring(limit * i, limit)));
+				}
+				else
+				{
+					sb.Append(Uri.EscapeDataString(value.Substring(limit * i)));
+				}
+			}
+
+			var encoded = sb.ToString();
 
 			return Regex
 				.Replace(encoded, "(%[0-9a-f][0-9a-f])", c => c.Value.ToUpper())
